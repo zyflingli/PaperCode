@@ -1,3 +1,3 @@
-from src.pattern_mining.miner import SequencePatternMiner
+from src.pattern_mining.miner import PatternMiner, SequencePatternMiner
 
-__all__ = ["SequencePatternMiner"]
+__all__ = ["PatternMiner", "SequencePatternMiner"]
