@@ -8,7 +8,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from src.utils.models import Event
+from src.utils.models import Event, UnifiedEvent
 
 
 @dataclass(frozen=True)
@@ -330,6 +330,97 @@ class ARASDataLoader:
 
         return sorted(events, key=lambda event: event.timestamp)
 
+    def to_unified_events(
+        self,
+        frame: pd.DataFrame,
+        metadata: ARASMetadata,
+        *,
+        base_date: datetime | None = None,
+        resident: str | None = None,
+        sensor_transitions_only: bool = True,
+        activity_changes_only: bool = True,
+        include_sensor_events: bool = True,
+        include_activity_events: bool = True,
+    ) -> list[UnifiedEvent]:
+        """Convert loaded ARAS rows to the cross-dataset UnifiedEvent format."""
+
+        if frame.empty:
+            return []
+
+        selected_resident = self.normalize_resident(resident) if resident is not None else None
+        base = base_date or datetime(2000, 1, 1)
+        sensor_by_id = {sensor.sensor_id: sensor for sensor in metadata.sensors}
+        sensor_columns = metadata.sensor_columns
+        missing = [column for column in sensor_columns + self.resident_columns if column not in frame]
+        if missing:
+            raise ValueError(f"Frame is missing ARAS columns: {missing}")
+
+        working = self._ensure_time_columns(frame, metadata.house)
+        houses_in_frame = {self.normalize_house(house) for house in working["house"].unique()}
+        if houses_in_frame != {metadata.house}:
+            raise ValueError(
+                "Frame house values do not match metadata house: "
+                f"frame={sorted(houses_in_frame)}, metadata={metadata.house}"
+            )
+
+        unified_events: list[UnifiedEvent] = []
+
+        for _, group in working.groupby(["house", "day"], sort=True):
+            group = group.sort_values("second_of_day")
+            timestamps = group.apply(
+                lambda row: base
+                + timedelta(days=int(row["day"]) - 1, seconds=int(row["second_of_day"])),
+                axis=1,
+            )
+
+            if include_sensor_events:
+                for sensor_id in sensor_columns:
+                    values = group[sensor_id].astype(int)
+                    active = values.eq(1)
+                    if sensor_transitions_only:
+                        previous = values.shift(fill_value=0)
+                        active = active & previous.eq(0)
+
+                    sensor = sensor_by_id[sensor_id]
+                    for index in group.index[active]:
+                        value = int(group.loc[index, sensor_id])
+                        unified_events.append(
+                            UnifiedEvent(
+                                timestamp=timestamps.loc[index],
+                                device=self._sensor_device(sensor),
+                                location=self._infer_location(sensor.place),
+                                action=self._sensor_action(sensor, value),
+                                value=value,
+                                resident=selected_resident,
+                                source_dataset="ARAS",
+                            )
+                        )
+
+            if include_activity_events:
+                residents = [selected_resident] if selected_resident else self.resident_columns
+                for resident_name in residents:
+                    values = group[resident_name].astype(int)
+                    changed = values.ne(values.shift())
+                    if not activity_changes_only:
+                        changed = pd.Series(True, index=group.index)
+
+                    for index in group.index[changed]:
+                        activity_id = int(group.loc[index, resident_name])
+                        activity_name = metadata.activities.get(activity_id, f"Activity {activity_id}")
+                        unified_events.append(
+                            UnifiedEvent(
+                                timestamp=timestamps.loc[index],
+                                device=resident_name,
+                                location="Activity Annotation",
+                                action=self._activity_action(activity_name),
+                                value=activity_id,
+                                resident=resident_name,
+                                source_dataset="ARAS",
+                            )
+                        )
+
+        return sorted(unified_events, key=lambda event: event.timestamp)
+
     def to_frame(self, events: list[Event]) -> pd.DataFrame:
         records = [
             {
@@ -382,6 +473,61 @@ class ARASDataLoader:
         text = re.sub(r"[^a-z0-9]+", "_", text)
         text = re.sub(r"_+", "_", text).strip("_")
         return text or "unknown"
+
+    @staticmethod
+    def _activity_action(activity_name: str) -> str:
+        text = re.sub(r"[^A-Za-z0-9]+", "_", activity_name.strip().upper())
+        return re.sub(r"_+", "_", text).strip("_") or "UNKNOWN"
+
+    @staticmethod
+    def _sensor_device(sensor: ARASSensorDefinition) -> str:
+        return sensor.place
+
+    @staticmethod
+    def _sensor_action(sensor: ARASSensorDefinition, value: int) -> str:
+        place = sensor.place.lower()
+        sensor_type = sensor.sensor_type.lower()
+        openable_keywords = [
+            "cabinet",
+            "cupboard",
+            "door",
+            "drawer",
+            "fridge",
+            "wardrobe",
+        ]
+        occupancy_keywords = ["armchair", "bed", "chair", "couch"]
+
+        if any(keyword in place for keyword in openable_keywords) or "contact" in sensor_type:
+            return "OPEN" if value == 1 else "CLOSE"
+        if any(keyword in place for keyword in occupancy_keywords) or any(
+            keyword in sensor_type for keyword in ["force", "pressure"]
+        ):
+            return "OCCUPIED" if value == 1 else "VACANT"
+        if "ir" in sensor_type or "distance" in sensor_type or "sonar" in sensor_type:
+            return "DETECTED" if value == 1 else "CLEARED"
+        return "ON" if value == 1 else "OFF"
+
+    @staticmethod
+    def _infer_location(place: str) -> str:
+        text = place.lower()
+        kitchen_keywords = ["fridge", "kitchen", "tap"]
+        bathroom_keywords = ["bathroom", "shower", "water closet"]
+        bedroom_keywords = ["bed", "wardrobe"]
+        living_room_keywords = ["armchair", "couch", "tv"]
+
+        if any(keyword in text for keyword in kitchen_keywords):
+            return "Kitchen"
+        if any(keyword in text for keyword in bathroom_keywords):
+            return "Bathroom"
+        if "hall" in text:
+            return "Hall"
+        if "house door" in text:
+            return "Entrance"
+        if any(keyword in text for keyword in bedroom_keywords):
+            return "Bedroom"
+        if any(keyword in text for keyword in living_room_keywords):
+            return "Living Room"
+        return place
 
     def _validate_day_frame(self, frame: pd.DataFrame, path: Path) -> None:
         if len(frame) != self.expected_rows_per_day:
@@ -442,3 +588,6 @@ class ARASDataLoader:
         if not match:
             return None
         return int(match.group(1)), match.group(2).strip()
+
+
+ARASLoader = ARASDataLoader

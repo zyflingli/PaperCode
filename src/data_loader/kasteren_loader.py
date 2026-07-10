@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.utils.models import Event
+from src.utils.models import Event, UnifiedEvent
 
 
 class KasterenDataLoader:
@@ -146,12 +146,168 @@ class KasterenDataLoader:
             columns=["action", "device", "timestamp", "location", "sensor_state"],
         ).sort_values("timestamp", ignore_index=True)
 
+    def to_unified_events(
+        self,
+        events: list[Event] | None = None,
+        *,
+        dataset_dir: str | Path | None = None,
+        include_activities: bool = True,
+    ) -> list[UnifiedEvent]:
+        """Convert Kasteren events to the cross-dataset UnifiedEvent format.
+
+        Provide ``dataset_dir`` to convert the raw Kasteren files directly.
+        Passing preloaded ``events`` is kept as a compatibility path for callers
+        that already use ``load``.
+        """
+
+        if dataset_dir is not None:
+            dataset_path = Path(dataset_dir)
+            unified_events = self.load_sensor_unified_events(dataset_path / self.default_sensor_file)
+            activity_path = dataset_path / self.default_activity_file
+            if include_activities and activity_path.exists():
+                unified_events.extend(self.load_activity_unified_events(activity_path))
+            return sorted(unified_events, key=lambda event: event.timestamp)
+
+        if events is None:
+            raise ValueError("Either dataset_dir or events must be provided")
+
+        unified_events = [
+            UnifiedEvent(
+                timestamp=event.timestamp,
+                device=self._unified_device(event),
+                location=self._title_location(event.location),
+                action=self._unified_action(event),
+                value=self._unified_value(event),
+                resident=None,
+                source_dataset="KASTEREN",
+            )
+            for event in events
+        ]
+        return sorted(unified_events, key=lambda event: event.timestamp)
+
+    def load_sensor_unified_events(self, path: str | Path) -> list[UnifiedEvent]:
+        rows, labels = self._read_event_rows(path, expected_columns=4)
+        events: list[UnifiedEvent] = []
+
+        for row in rows:
+            start_time, _, sensor_id, value = self._pad_row(row, 4)
+            timestamp = self._parse_timestamp(start_time)
+            if pd.isna(timestamp):
+                continue
+
+            normalized_id = self._clean_scalar(sensor_id)
+            raw_device = labels.get(normalized_id) or f"sensor_{normalized_id or 'unknown'}"
+            device = self._title_name(raw_device)
+            normalized_device = self.normalize_name(raw_device)
+            coerced_value = self._coerce_value(value)
+
+            events.append(
+                UnifiedEvent(
+                    timestamp=timestamp.to_pydatetime(),
+                    device=device,
+                    location=self._title_location(
+                        self.device_locations.get(normalized_device, "unknown")
+                    ),
+                    action=self._sensor_action(coerced_value),
+                    value=coerced_value,
+                    resident=None,
+                    source_dataset="KASTEREN",
+                )
+            )
+
+        return sorted(events, key=lambda event: event.timestamp)
+
+    def load_activity_unified_events(self, path: str | Path) -> list[UnifiedEvent]:
+        rows, labels = self._read_event_rows(path, expected_columns=3)
+        events: list[UnifiedEvent] = []
+
+        for row in rows:
+            start_time, _, activity_id = self._pad_row(row, 3)
+            timestamp = self._parse_timestamp(start_time)
+            if pd.isna(timestamp):
+                continue
+
+            normalized_id = self._clean_scalar(activity_id)
+            raw_action = labels.get(normalized_id) or f"activity_{normalized_id or 'unknown'}"
+            action = self.normalize_name(raw_action)
+
+            events.append(
+                UnifiedEvent(
+                    timestamp=timestamp.to_pydatetime(),
+                    device="Activity Annotation",
+                    location=self._title_location(self.activity_locations.get(action, "unknown")),
+                    action=self._activity_action(action),
+                    value=self._coerce_activity_id(normalized_id),
+                    resident=None,
+                    source_dataset="KASTEREN",
+                )
+            )
+
+        return sorted(events, key=lambda event: event.timestamp)
+
     @staticmethod
     def normalize_name(value: Any) -> str:
         text = str(value).strip().strip("'\"").lower()
         text = re.sub(r"[^a-z0-9]+", "_", text)
         text = re.sub(r"_+", "_", text).strip("_")
         return text or "unknown"
+
+    @staticmethod
+    def _title_location(value: str | None) -> str:
+        text = str(value or "unknown").replace("_", " ").strip()
+        return text.title() if text else "Unknown"
+
+    @staticmethod
+    def _activity_action(action: str) -> str:
+        text = re.sub(r"[^A-Za-z0-9]+", "_", action.strip().upper())
+        return re.sub(r"_+", "_", text).strip("_") or "UNKNOWN"
+
+    @staticmethod
+    def _title_name(value: str | None) -> str:
+        text = str(value or "unknown").replace("_", " ").strip()
+        return text.title() if text else "Unknown"
+
+    @staticmethod
+    def _sensor_action(value: Any) -> str:
+        if value == 1:
+            return "ON"
+        if value == 0:
+            return "OFF"
+        return "SENSOR_FIRED"
+
+    @staticmethod
+    def _coerce_activity_id(value: Any) -> int | str | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _unified_device(event: Event) -> str:
+        sensor_state = event.sensor_state or {}
+        if sensor_state.get("source") == "activity":
+            return "Activity Annotation"
+        return KasterenDataLoader._title_name(event.device)
+
+    def _unified_action(self, event: Event) -> str:
+        sensor_state = event.sensor_state or {}
+        if sensor_state.get("source") == "activity":
+            return self._activity_action(event.action)
+
+        return self._sensor_action(self._unified_value(event))
+
+    @staticmethod
+    def _unified_value(event: Event) -> Any:
+        sensor_state = event.sensor_state or {}
+        if sensor_state.get("source") == "activity":
+            activity_id = sensor_state.get("activity_id")
+            try:
+                return int(activity_id)
+            except (TypeError, ValueError):
+                return activity_id
+        return sensor_state.get("value")
 
     def _read_event_rows(
         self,
@@ -229,3 +385,6 @@ class KasterenDataLoader:
         if float(numeric).is_integer():
             return int(numeric)
         return float(numeric)
+
+
+KasterenLoader = KasterenDataLoader

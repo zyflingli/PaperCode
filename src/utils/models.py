@@ -12,6 +12,19 @@ class Event(BaseModel):
     sensor_state: dict[str, Any] = Field(default_factory=dict)
 
 
+class UnifiedEvent(BaseModel):
+    timestamp: datetime | str
+    device: str
+    location: str
+    action: str
+    value: Any = None
+    resident: str | None = None
+    source_dataset: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
 class SequencePattern(BaseModel):
     sequence: list[str]
     support: int

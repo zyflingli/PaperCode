@@ -1,3 +1,3 @@
-from src.utils.models import Event, SequencePattern, TAPRule
+from src.utils.models import Event, SequencePattern, TAPRule, UnifiedEvent
 
-__all__ = ["Event", "SequencePattern", "TAPRule"]
+__all__ = ["Event", "SequencePattern", "TAPRule", "UnifiedEvent"]
