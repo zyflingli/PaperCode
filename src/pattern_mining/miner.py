@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations
 from math import floor
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
@@ -13,6 +13,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only when optional dep is absent.
     PrefixSpan = None
 
+from src.data.models import SensorEvent
 from src.utils.models import Pattern, SequencePattern
 
 
@@ -38,17 +39,20 @@ class PatternMiner:
         self.transaction_window_seconds = transaction_window_seconds
         self.session_gap_seconds = session_gap_seconds
 
-    def mine(self, events: Any, *, top_k: int = 10) -> dict[str, list[Pattern]]:
+    def mine(
+        self, events: Sequence[SensorEvent], *, top_k: int = 10
+    ) -> dict[str, list[Pattern]]:
         """Return top-K patterns for each category."""
 
-        records = self._normalize_records(events)
         return {
-            "single": self.mine_single_action_patterns(records, top_k=top_k),
-            "set": self.mine_action_set_patterns(records, top_k=top_k),
-            "sequence": self.mine_sequence_patterns(records, top_k=top_k),
+            "single": self.mine_single_action_patterns(events, top_k=top_k),
+            "set": self.mine_action_set_patterns(events, top_k=top_k),
+            "sequence": self.mine_sequence_patterns(events, top_k=top_k),
         }
 
-    def mine_single_action_patterns(self, events: Any, *, top_k: int = 10) -> list[Pattern]:
+    def mine_single_action_patterns(
+        self, events: Sequence[SensorEvent], *, top_k: int = 10
+    ) -> list[Pattern]:
         """Mine P(action | context) for every action observed in each context."""
 
         records = self._normalize_records(events)
@@ -75,7 +79,9 @@ class PatternMiner:
         ]
         return self._top_k(patterns, top_k)
 
-    def mine_action_set_patterns(self, events: Any, *, top_k: int = 10) -> list[Pattern]:
+    def mine_action_set_patterns(
+        self, events: Sequence[SensorEvent], *, top_k: int = 10
+    ) -> list[Pattern]:
         """Mine frequent action itemsets with an Apriori pass per context."""
 
         records = self._normalize_records(events)
@@ -99,7 +105,9 @@ class PatternMiner:
 
         return self._top_k(patterns, top_k)
 
-    def mine_sequence_patterns(self, events: Any, *, top_k: int = 10) -> list[Pattern]:
+    def mine_sequence_patterns(
+        self, events: Sequence[SensorEvent], *, top_k: int = 10
+    ) -> list[Pattern]:
         """Mine frequent action sequences using PrefixSpan when available."""
 
         records = self._normalize_records(events)
@@ -127,30 +135,19 @@ class PatternMiner:
 
         return self._top_k(patterns, top_k)
 
-    def _normalize_records(self, events: Any) -> list[Record]:
+    def _normalize_records(self, events: Sequence[SensorEvent]) -> list[Record]:
         if events is None:
-            return []
-        if isinstance(events, pd.DataFrame):
-            return events.to_dict("records")
+            raise TypeError("events must be a sequence of SensorEvent objects")
 
         records: list[Record] = []
-        for event in events:
-            if hasattr(event, "model_dump"):
-                record = event.model_dump()
-            elif hasattr(event, "to_dict"):
-                record = event.to_dict()
-            elif isinstance(event, dict):
-                record = dict(event)
-            else:
-                record = {
-                    "action": getattr(event, "action", None),
-                    "device": getattr(event, "device", None),
-                    "timestamp": getattr(event, "timestamp", None),
-                    "location": getattr(event, "location", None),
-                    "resident": getattr(event, "resident", None),
-                    "source_dataset": getattr(event, "source_dataset", None),
-                }
-            records.append(record)
+        try:
+            iterator = iter(events)
+        except TypeError as exc:
+            raise TypeError("events must be a sequence of SensorEvent objects") from exc
+        for index, event in enumerate(iterator):
+            if type(event) is not SensorEvent:
+                raise TypeError(f"events[{index}] must be a SensorEvent")
+            records.append(event.model_dump())
 
         return sorted(records, key=self._sort_key)
 

@@ -3,24 +3,30 @@ from datetime import datetime, timezone
 from src.event_processor.processor import EventProcessor
 from src.pattern_mining.miner import SequencePatternMiner
 from src.rule_generation.generator import TAPRuleGenerator
-from src.utils.models import Event
+from src.data.models import SensorEvent
 
 
 def main() -> None:
     events = [
-        Event(
-            action="motion_detected",
-            device="motion_sensor",
+        SensorEvent(
+            action="DETECTED",
+            device_id="motion_sensor",
+            device_name="Motion Sensor",
             timestamp=datetime.now(timezone.utc),
+            dataset="demo",
             location="living_room",
-            sensor_state={"motion": True},
+            sensor_type="motion",
+            value=1,
         ),
-        Event(
-            action="turn_on",
-            device="light",
+        SensorEvent(
+            action="ON",
+            device_id="light",
+            device_name="Light",
             timestamp=datetime.now(timezone.utc),
+            dataset="demo",
             location="living_room",
-            sensor_state={"brightness": 80},
+            sensor_type="switch",
+            value=1,
         ),
     ]
 
